@@ -1,0 +1,923 @@
+package codingagent
+
+import (
+	"cmp"
+	"context"
+	"errors"
+	"fmt"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	"pi/coding/extension"
+	"pi/coding/extension/host/inproc"
+	"pi/tui"
+)
+
+// ─── Slash Command Registry ───────────────────────────────────────────────────
+//
+// Mirrors upstream pi's `core/slash-commands.ts` built-in command list
+// (`BUILTIN_SLASH_COMMANDS`) and the per-handler dispatch in
+// `dist/modes/interactive/slash-command-handlers/`. Every upstream builtin
+// is implemented here; none are stubs.
+//
+// Extensions register dynamic commands through the existing
+// `ExtensionAPI.RegisterCommand` path. The registry below merges
+// builtins + extension commands at lookup time so `/help` lists both
+// and aliases work uniformly.
+
+// SlashCommandSource mirrors upstream's `SlashCommandSource` discriminator.
+type SlashCommandSource string
+
+const (
+	SlashSourceBuiltin   SlashCommandSource = "builtin"
+	SlashSourceExtension SlashCommandSource = "extension"
+	SlashSourcePrompt    SlashCommandSource = "prompt" // <agentDir>/prompts/*.md
+)
+
+// SlashHandler runs a builtin slash command. Handlers receive the
+// SlashContext (which carries args + accessors + output sinks) and may
+// return an error. A non-nil error causes the registry's Dispatch to
+// surface "Error: <msg>" to the user.
+type SlashHandler func(sc *SlashContext) error
+
+// BuiltinSlashCommand is the canonical shape for every command exposed
+// to users. Aliases are first-class. (Note: upstream pi does NOT alias
+// /exit → /quit; only /quit exists. We match that behavior: no alias.)
+type BuiltinSlashCommand struct {
+	Name        string
+	Aliases     []string
+	Description string
+	// ArgumentHint is shown after the command in autocomplete (e.g.
+	// "<provider/model>"). Optional. Mirrors upstream argumentHint.
+	ArgumentHint string
+	Handler      SlashHandler
+	// Hidden commands dispatch normally but are omitted from /help and
+	// autocomplete. Mirrors upstream commands handled inline in the submit
+	// handler that are absent from the canonical slash-commands.js list
+	// (e.g. /debug).
+	Hidden bool
+}
+
+// ReloadDiag holds resource counts and diagnostic warnings surfaced by
+// /reload. Mirrors the information upstream showLoadedResources collects
+// (interactive-mode.ts:1231-1410). Counts are always populated; the
+// Diagnostics slice carries one human-readable warning line per conflict
+// (commands, shortcuts, extension load errors).
+type ReloadDiag struct {
+	ContextFiles int
+	Skills       int
+	Prompts      int
+	Extensions   int
+	Themes       int
+	// Diagnostics is one human-readable line per warning/error gathered
+	// during reload. Mirrors upstream's `[Extension issues]`,
+	// `[Skill conflicts]`, `[Prompt conflicts]` sections.
+	Diagnostics []string
+	// Cells is the placement summary produced by the subprocess host. Empty
+	// when no subprocess host is active (e.g. headless commands).
+	// pi-specific. Used by /reload --explain.
+	Cells []ReloadCellDiag
+	// ReloadDuration is the wall time spent in subprocess Reload(). Zero when
+	// the host is not active.
+	ReloadDuration time.Duration
+}
+
+// ReloadCellDiag is a UI-safe copy of subprocess.ReloadCellReport. It is
+// duplicated here so internal/codingagent can render /reload --explain without
+// importing the subprocess host package directly.
+type ReloadCellDiag struct {
+	Key           string
+	Strategy      string
+	Language      string
+	Extensions    []string
+	Hash          string
+	BinaryPath    string
+	Cached        bool
+	BuildDuration time.Duration
+	Replaced      bool
+	Quarantined   bool
+	Reason        string
+}
+
+// SlashContext is the per-dispatch context handed to a handler. Accessor
+// fields are populated by the host (interactive mode); handlers read
+// them and write user-visible output via the `Append` sink. `Quit` is
+// the requested-exit signal: only `/exit` and `/quit` set it. `Clear`
+// is requested by `/clear` and `/new`.
+type SlashContext struct {
+	// Raw args after the command name (already trimmed). Empty if user
+	// just typed `/foo` with no args.
+	Args string
+
+	// Output sinks: must be non-nil when Dispatch is called.
+	Append     func(string) // append markdown to chat (Markdown component, 1px padding)
+	AppendText func(string) // append plain ANSI text to chat (Text component, 1px padding)
+	// AppendBlock appends Spacer(1) and Text(text, 1, 1), the confirmation
+	// block upstream handlers such as handleDebugCommand add. The text is not
+	// Markdown, so paths keep their backslashes.
+	AppendBlock func(string)
+	Clear       func() // clear the chat transcript
+	Quit        func() // request session exit
+	Reset       func() // /new: keep transcript visible but reset agent messages
+	// NewSession creates a fresh session file and resets agent state.
+	// Mirrors upstream runtimeHost.newSession(). May be nil in test contexts.
+	NewSession func() error
+	// FatalRuntimeError records an unrecoverable create/resume/import
+	// replacement failure, then requests a status-1 exit after TUI teardown.
+	FatalRuntimeError func(prefix string, err error) error
+
+	// ShowStatus appends or updates the status line.
+	ShowStatus  func(msg string)
+	ShowWarning func(msg string)
+
+	// Accessors. Any of these may be nil; handlers must guard. Keeps
+	// the registry decoupled from the full InteractiveMode struct so
+	// /help and friends are unit-testable in isolation.
+	ModelName func() string
+	// SelectedModelKey is `provider/id` of the session's selected model, the key of a single-model /session cost total.
+	SelectedModelKey func() string
+	ToolNames        func() []string
+	// ToolRenderers returns how HTML exports draw tool calls; see [ExportToolRenderers].
+	ToolRenderers func() func(name string) *extension.ToolRenderers
+	// ShareState returns the system prompt and active tool schemas for the
+	// pi.share entry attached to exported transcripts.
+	ShareState func() ShareState
+	// ShareSession uploads an explicitly requested share artifact. The host
+	// captures the command context so cancellation reaches the HTTP request.
+	ShareSession  func(session *Session, state ShareState, showStatus func(string)) (string, error)
+	SkillNames    func() []string
+	SessionInfo   func() (id, dir string, msgCount int)
+	LastAssistant func() string
+	CopyClipboard func(text string) error
+	CostSummary   func() string
+	ShowHotkeys   func()
+
+	// All registered commands: set by Dispatch before calling Handler
+	// so /help can enumerate the live set.
+	AllCommands []SlashCommandInfo
+
+	// Session accessors. May be nil; handlers must guard.
+	CurrentSession func() *Session
+	// CacheWarmingStatus reports the Session's cache warmer, or nil when the
+	// Session has none.
+	CacheWarmingStatus func() *CacheWarmingStatus
+	SetSessionName     func(name string) error
+	GetSessionName     func() string
+	// OnNameChange is called after a successful /name set so callers can
+	// update the terminal title and status-line footer.
+	OnNameChange func(name string)
+	// ForkAtEntry moves the leaf to entryID IN THE SAME FILE (upstream
+	// `session.branch`). Used by /tree navigation, not /fork.
+	ForkAtEntry func(entryID string) error
+	// FlushCompactionQueue delivers messages that were queued while a
+	// compaction was running. Tree navigation calls it once the new leaf is in
+	// place, mirroring upstream's flushCompactionQueue after "Navigated to
+	// selected point" (interactive-mode.ts:1847, 5021), so a message typed
+	// during compaction is not left queued by navigating away.
+	FlushCompactionQueue func()
+	// ForkToNewSession forks the selected user message into a NEW session
+	// file (branch copied up to the message's parent), switches to it, and
+	// prefills the editor with the message text. Mirrors upstream /fork
+	// (agent-session-runtime.ts fork(), position "before").
+	ForkToNewSession func(userMsgEntryID string) error
+	// WriteDebugLog writes the current frame and message history to a debug
+	// log file and returns its path. Backs /debug and the ctrl+shift+d hotkey.
+	WriteDebugLog func() (path string, err error)
+	CloneCurrent  func() (newPath string, err error)
+	ListSessions  func() ([]SessionInfo, error)
+	RenderTree    func() string
+
+	// File-based prompt templates loaded from
+	// <agentDir>/prompts and <cwd>/.pi/prompts. Read-only snapshot;
+	// host populates this each Dispatch.
+	PromptTemplates []PromptTemplate
+
+	// Modal selector callbacks. Nil in headless or test
+	// contexts; handlers must guard and fall back to text mode.
+	PickSession     func() (path string, ok bool)
+	PickUserMessage func() (entryID string, ok bool)
+	PickTreeEntry   func(initialSelectedID string) (entryID string, ok bool)
+	// AppendLabelChange writes a label entry for targetID.
+	// label=="" clears any existing label (upstream: undefined→delete).
+	AppendLabelChange func(targetID, label string) error
+	LoadSessionPath   func(path string) error
+	// ResumeStatus, when set, returns the status /resume shows after LoadSessionPath succeeds. The default is "Resumed session".
+	ResumeStatus func() string
+	// ImportSession imports a session JSONL file through the Session and
+	// reports whether session_before_switch cancelled the switch. Mirrors
+	// upstream runtimeHost.importFromJsonl.
+	ImportSession func(inputPath, cwdOverride string) (cancelled bool, err error)
+
+	// Manual context compaction.
+	// CompactSession triggers a manual compact on the current session.
+	// The closure captures the appropriate context internally.
+	// nil in headless / test contexts unless explicitly wired.
+	CompactSession func(customInstructions string) error
+
+	// /tree summarize-branch flow: a fixed-option picker and a text prompt in
+	// the editor slot; each returns ok=false on cancel (Esc).
+	ShowExtensionSelector func(title string, options []string, description string) (string, bool)
+	ShowExtensionEditor   func(title, description, prefill string) (string, bool)
+	// ShowTrustSelector invokes OnSelect before restoring the editor so persistence precedes closing the selector.
+	ShowTrustSelector func(TrustSelectorOptions) (TrustSelection, bool)
+	// UpstreamVersion returns the pinned Pi version. May be nil.
+	UpstreamVersion func() string
+	// CurrentTuiMode returns the running renderer's mode, independent of the saved default. Nil outside the interactive UI.
+	CurrentTuiMode func() string
+	// SwitchTuiMode switches the running renderer before the settings list saves a TUI mode, and returns false when the switch is refused. Nil outside the interactive UI.
+	SwitchTuiMode func(mode string) bool
+	// ShowSettingsList presents the dedicated two-column settings selector and
+	// blocks until the user cancels. Each change calls onChange while the list
+	// stays open with its selection and search, as upstream SettingsList's
+	// onChange does; the row then shows the value onChange returns.
+	ShowSettingsList func(items []tui.SettingItem, onChange func(id, value string) string)
+	// ShowSettingsSubmenu is ShowSettingsList for a nested settings menu:
+	// upstream builds those lists with Math.min(items.length, 10) rows and no
+	// search.
+	ShowSettingsSubmenu func(items []tui.SettingItem, onChange func(id, value string) string)
+	// ShowSelectList presents a non-search submenu selector with optional
+	// description column. Used by /settings for upstream-style submenus like
+	// thinking level. Returns the chosen value or ("", false) on cancel.
+	ShowSelectList func(title, description string, items []tui.SelectItem, currentValue string) (value string, ok bool)
+	// ShowThemeSelector presents the theme submenu with live preview.
+	// Used by /settings theme to mirror upstream theme preview semantics.
+	ShowThemeSelector func(currentTheme string) (themeName string, ok bool)
+	// AvailableThinkingLevels returns the currently supported levels for the
+	// active model. Used by /settings to build the thinking submenu.
+	AvailableThinkingLevels func() []string
+	// CurrentThinkingLevel and SelectThinkingLevel back /thinking. May be nil.
+	CurrentThinkingLevel func() string
+	SelectThinkingLevel  func(level string)
+	// ShowThinkingSelector opens the /thinking selector (upstream
+	// showThinkingSelector). May be nil; /thinking then falls back to
+	// ShowSelectList.
+	ShowThinkingSelector func()
+	// ModelThinkingSubmenu builds the per-model default override submenu.
+	ModelThinkingSubmenu func(string, func(*string)) tui.Component
+	// NavigateTreeFull forks to targetID and optionally generates a branch
+	// summary. Mirrors upstream AgentSession.navigateTree() with summarize flag.
+	NavigateTreeFull func(ctx context.Context, targetID string, summarize bool, customInstructions string) (NavigateTreeResult, error)
+	// AbortBranchSummary cancels an in-progress branch summarization.
+	AbortBranchSummary func()
+	// SetEditorText sets the editor content (e.g. pre-filling user message
+	// text when navigating to a user-message entry).
+	SetEditorText func(text string)
+
+	// Mid-session model switch.
+	SwitchModel           func(spec string) error
+	modelSelectionPersist bool
+	PickModel             func(initialQuery string) (spec string, ok bool)
+	ResolveModel          func(input string) (spec string, ok bool)
+
+	// /scoped-models selector.
+	ShowScopedModels func() // opens editor-slot scoped-models list
+
+	// Settings UI.
+	// SettingsManager provides read/write access to global settings.
+	SettingsManager *SettingsManager
+
+	// Reload triggers a reload of settings and prompt templates.
+	// Called by the /reload command. May be nil in headless contexts.
+	Reload func() error
+
+	// ReloadDiagnostics returns resource counts after a reload.
+	// Mirrors upstream showLoadedResources with showDiagnosticsWhenQuiet.
+	// May be nil; handler falls back to a static message.
+	ReloadDiagnostics func() ReloadDiag
+
+	// OnSettingApplied is called after /settings persists a change.
+	// id is the setting identifier (e.g. "hide-thinking"), value is the new value.
+	// Interactive mode uses this to apply live state changes (e.g. update
+	// m.hideThinking without requiring a restart). May be nil.
+	// Mirrors upstream settings-selector.ts callbacks (onHideThinkingChange etc.).
+	OnSettingApplied func(id, value string)
+
+	// AgentDir is the pi config dir (typically ~/.pi/agent).
+	// Used by /login and /logout for auth.json access.
+	AgentDir string
+
+	// Parity harness hooks used only by env-gated test slash commands.
+	ProbeClipboardRead     func() (string, error)
+	ProbeImageFallback     func() (string, error)
+	ProbeCancellableLoader func() (string, error)
+	ProbeSelectList        func() (string, error)
+	ProbeOAuthShared       func() (string, error)
+	ProbeOAuthCallbackPage func() (string, error)
+	ProbeCopilotHeaders    func() (string, error)
+	ProbeOAuthCopilot      func() (string, error)
+	ProbeOAuthCopilotEnv   func() (string, error)
+	ProbeOAuthAnthropic    func() (string, error)
+	ProbeOAuthCodex        func() (string, error)
+
+	// Provider metadata and modal callbacks for /login and /logout.
+	LoginProviders     func() []tui.OAuthProvider
+	LogoutProviders    func() ([]tui.OAuthProvider, error)
+	SelectAuthProvider func(mode string, providers []tui.OAuthProvider, initialSearch string) (tui.OAuthProvider, bool)
+	// SelectAuthMethod returns "oauth" or "api_key", or the ID of a provider the top-level menu (nil providers) offers
+	// directly, such as Radius.
+	SelectAuthMethod func(providers []tui.OAuthProvider) (choice string, ok bool)
+	// StartProviderLogin returns errLoginCancelled when the user cancels the login, which reopens the menu it was
+	// started from.
+	StartProviderLogin func(provider tui.OAuthProvider) error
+
+	// Logout removes stored credentials for the given provider.
+	// Mirrors upstream showOAuthSelector logout branch (interactive-mode.ts:4299).
+	// May be nil in headless/test contexts; handlers must guard.
+	Logout func(provider string) error
+
+	// ExtRunner is the extension runner for emitting events from slash commands.
+	// May be nil in headless/test contexts; handlers must guard.
+	ExtRunner *inproc.Runner
+
+	// Skills is the loaded set of skill definitions for /skill listing.
+	Skills []*SkillDef
+}
+
+// SessionTokenStats holds token usage for the /session display.
+// Mirrors upstream SessionStats.tokens (agent-session.ts:2913-2918).
+type SessionTokenStats struct {
+	Input      int
+	Output     int
+	CacheRead  int
+	CacheWrite int
+	Total      int
+	Cost       float64 // USD; only shown if > 0
+}
+
+// NavigateTreeResult is the TUI-facing result of a tree navigation operation.
+// Re-exported here (from coding.NavigateTreeResult) so slash handlers don't
+// need to import the public SDK package (cycle prevention).
+type NavigateTreeResult struct {
+	EditorText string
+	Cancelled  bool
+	Aborted    bool
+}
+
+// SlashCommandInfo is the user-facing summary used by `/help`.
+type SlashCommandInfo struct {
+	Name        string
+	Aliases     []string
+	Description string
+	Source      SlashCommandSource
+}
+
+// SlashRegistry holds builtins + extension-registered dynamic commands
+// and resolves aliases. Concurrent-safe.
+type SlashRegistry struct {
+	mu       sync.RWMutex
+	builtins map[string]*BuiltinSlashCommand
+	aliases  map[string]string       // alias → canonical name
+	dynamic  map[string]SlashCommand // extension-registered
+}
+
+// NewSlashRegistry seeds a registry with the built-in commands.
+func NewSlashRegistry() *SlashRegistry {
+	r := &SlashRegistry{
+		builtins: make(map[string]*BuiltinSlashCommand),
+		aliases:  make(map[string]string),
+		dynamic:  make(map[string]SlashCommand),
+	}
+	for _, c := range defaultBuiltins() {
+		r.Register(c)
+	}
+	return r
+}
+
+// Register adds (or replaces) a builtin and its aliases. Used both
+// internally for the seed list and externally if a host wants to inject
+// extra builtins (tests do this).
+func (r *SlashRegistry) Register(cmd BuiltinSlashCommand) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	c := cmd
+	r.builtins[cmd.Name] = &c
+	for _, a := range cmd.Aliases {
+		r.aliases[a] = cmd.Name
+	}
+}
+
+// ReplaceDynamic replaces every extension-registered slash command with cmds,
+// so a command whose extension is no longer loaded stops resolving.
+func (r *SlashRegistry) ReplaceDynamic(cmds []SlashCommand) {
+	dynamic := make(map[string]SlashCommand, len(cmds))
+	for _, cmd := range cmds {
+		cmd.Name = strings.TrimPrefix(cmd.Name, "/")
+		dynamic[cmd.Name] = cmd
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.dynamic = dynamic
+}
+
+// Resolve returns the canonical name for a typed-in command, walking
+// aliases. Returns ("", false) if neither builtin nor extension command
+// matches.
+func (r *SlashRegistry) Resolve(name string) (string, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if _, ok := r.builtins[name]; ok {
+		return name, true
+	}
+	if canon, ok := r.aliases[name]; ok {
+		return canon, true
+	}
+	if _, ok := r.dynamic[name]; ok {
+		return name, true
+	}
+	return "", false
+}
+
+// IsBuiltin reports whether name (or an alias) is a built-in command, the
+// commands upstream's onSubmit handles in its builtin chain.
+func (r *SlashRegistry) IsBuiltin(name string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if _, ok := r.builtins[name]; ok {
+		return true
+	}
+	_, ok := r.aliases[name]
+	return ok
+}
+
+// All returns a sorted list of every command (builtin + extension) for
+// /help rendering.
+func (r *SlashRegistry) All() []SlashCommandInfo {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]SlashCommandInfo, 0, len(r.builtins)+len(r.dynamic))
+	for _, b := range r.builtins {
+		if b.Hidden {
+			continue
+		}
+		out = append(out, SlashCommandInfo{
+			Name:        b.Name,
+			Aliases:     append([]string(nil), b.Aliases...),
+			Description: b.Description,
+			Source:      SlashSourceBuiltin,
+		})
+	}
+	for _, d := range r.dynamic {
+		out = append(out, SlashCommandInfo{
+			Name:        d.Name,
+			Description: d.Description,
+			Source:      SlashSourceExtension,
+		})
+	}
+	slices.SortFunc(out, func(a, b SlashCommandInfo) int { return cmp.Compare(a.Name, b.Name) })
+	return out
+}
+
+// ErrUnknownSlashCommand signals that a slash command was not found in the
+// registry. The caller should pass the original text to the LLM as a regular
+// message (matches upstream behavior where unknown slashes are sent as-is).
+var ErrUnknownSlashCommand = errors.New("unknown slash command")
+
+// Dispatch parses a line like `/foo bar baz` and routes it. Returns
+// ErrUnknownSlashCommand if the command is not registered (the caller should
+// forward the text to the LLM). Returns other errors if the handler failed.
+// The host is responsible for surfacing errors to the user: Dispatch
+// itself does not call sc.Append for errors.
+//
+// extCtx is the bridge to extension-registered commands (which take a
+// different handler signature). May be nil if no extensions are loaded.
+func (r *SlashRegistry) Dispatch(sc *SlashContext, line string, extCtx *ExtensionContext) error {
+	name, args := parseSlashLine(line)
+	if name == "" {
+		return fmt.Errorf("empty slash command")
+	}
+	canon, ok := r.Resolve(name)
+	if !ok {
+		return ErrUnknownSlashCommand
+	}
+
+	r.mu.RLock()
+	if b, ok := r.builtins[canon]; ok {
+		handler := b.Handler
+		r.mu.RUnlock()
+		sc.Args = args
+		sc.AllCommands = r.All()
+		if handler == nil {
+			return fmt.Errorf("/%s: no handler bound", canon)
+		}
+		return handler(sc)
+	}
+	d, ok := r.dynamic[canon]
+	r.mu.RUnlock()
+	if ok {
+		if d.Handler == nil {
+			return fmt.Errorf("/%s: extension registered with nil handler", canon)
+		}
+		if extCtx == nil {
+			return fmt.Errorf("/%s: no extension context", canon)
+		}
+		return d.Handler(extCtx, args)
+	}
+	return fmt.Errorf("unknown command: /%s", name)
+}
+
+// parseSlashLine splits "/cmd rest of line" into ("cmd", "rest of line").
+// Leading slash is required; whitespace around the name is consumed.
+func parseSlashLine(line string) (name, args string) {
+	s := strings.TrimSpace(line)
+	if !strings.HasPrefix(s, "/") {
+		return "", ""
+	}
+	s = strings.TrimPrefix(s, "/")
+	if i := strings.IndexAny(s, " \t"); i >= 0 {
+		return strings.TrimSpace(s[:i]), strings.TrimSpace(s[i+1:])
+	}
+	return strings.TrimSpace(s), ""
+}
+
+// ─── Builtin handlers ────────────────────────────────────────────────────────
+
+// BuiltinSlashCommands returns the canonical builtin slash command
+// list (name + description + aliases). Single source of truth for
+// `/help`, the dispatcher, and the autocomplete popup -
+// mirrors upstream's `BUILTIN_SLASH_COMMANDS` re-export from
+// `core/slash-commands.ts`.
+func BuiltinSlashCommands() []BuiltinSlashCommand { return defaultBuiltins() }
+
+func defaultBuiltins() []BuiltinSlashCommand {
+	cmds := []BuiltinSlashCommand{
+		{Name: "settings", Description: "Open settings menu", Handler: settingsHandler},
+		{Name: "model", Description: "Select model (opens selector UI)", ArgumentHint: "<provider/model>", Handler: modelHandler},
+		{Name: "tree", Description: "Navigate session tree (switch branches)", Handler: treeHandler},
+		{Name: "thinking", Description: "Set thinking level", ArgumentHint: "<level>", Handler: thinkingHandler},
+		{Name: "scoped-models", Description: "Enable/disable models for Ctrl+P cycling", Handler: scopedModelsHandler},
+		{Name: "export", Description: "Export session (HTML default, or specify path: .html/.jsonl)", Handler: exportHandler},
+		{Name: "import", Description: "Import and resume a session from a JSONL file", Handler: importHandler},
+		// pi divergence (D64): pi shares through its own expiring gateway, not a GitHub gist.
+		// pi divergence (D62): /bug exports a local archive for a pi issue; it never uploads.
+		{Name: "copy", Description: "Copy last agent message to clipboard", Handler: copyHandler},
+		{Name: "name", Description: "Set session display name", Handler: nameHandler},
+		{Name: "session", Description: "Show session info and stats", Handler: sessionHandler},
+		{Name: "hotkeys", Description: "Show all keyboard shortcuts", Handler: hotkeysHandler},
+		{Name: "fork", Description: "Create a new fork from a previous user message", Handler: forkHandler},
+		{Name: "clone", Description: "Duplicate the current session at the current position", Handler: cloneHandler},
+		{Name: "trust", Description: "Save project trust decision for future sessions", Handler: trustHandler},
+		{Name: "login", Description: "Configure provider authentication", ArgumentHint: "<provider>", Handler: loginHandler},
+		{Name: "logout", Description: "Remove stored provider authentication", Handler: logoutHandler},
+		{Name: "new", Description: "Start a new session", Handler: newHandler},
+		{Name: "compact", Description: "Manually compact the session context", Handler: compactHandler},
+		{Name: "resume", Description: "Resume a different session", Handler: resumeHandler},
+		{Name: "reload", Description: "Reload keybindings, skills, prompts, themes, and context files", Handler: reloadHandler},
+		{Name: "quit", Description: "Quit " + AppName, Handler: quitHandler},
+		// Hidden: dispatchable but absent from /help and autocomplete, matching
+		// upstream (handled inline in the submit handler, not in the canonical
+		// slash-commands.js completion list). /debug writes a debug log; it is
+		// also bound to the ctrl+shift+d global hotkey.
+		{Name: "debug", Description: "Write a debug log", Handler: debugHandler, Hidden: true},
+	}
+	return cmds
+}
+
+func quitHandler(sc *SlashContext) error {
+	if sc.Quit != nil {
+		sc.Quit()
+	}
+	return nil
+}
+
+func modelHandler(sc *SlashContext) error {
+	current := "(unknown)"
+	if sc.ModelName != nil {
+		current = sc.ModelName()
+	}
+
+	if sc.Args == "" {
+		// Empty args: prefer the picker overlay if available.
+		if sc.PickModel != nil && sc.SwitchModel != nil {
+			spec, ok := sc.PickModel("")
+			if !ok {
+				return nil
+			}
+			if err := sc.SwitchModel(spec); err != nil {
+				return fmt.Errorf("model switch failed: %w", err)
+			}
+			showModelSelectionStatus(sc, spec)
+			return nil
+		}
+		// Headless or test context: just print current.
+		sc.Append(fmt.Sprintf("Current model: %s", current))
+		// Upstream v0.70.0 hint text.
+		sc.Append("(Model picker unavailable in this context. Only showing models from configured providers. Use /login to add providers.)")
+		return nil
+	}
+
+	// Direct switch: /model <spec>
+	if sc.SwitchModel == nil {
+		sc.Append("Model switching is not available in this context.")
+		return nil
+	}
+	spec := sc.Args
+	if sc.ResolveModel != nil {
+		resolved, ok := sc.ResolveModel(sc.Args)
+		switch {
+		case ok:
+			spec = resolved
+		case sc.PickModel != nil:
+			picked, pickedOK := sc.PickModel(sc.Args)
+			if !pickedOK {
+				return nil
+			}
+			spec = picked
+		default:
+			sc.Append("No matching models")
+			return nil
+		}
+	}
+	if err := sc.SwitchModel(spec); err != nil {
+		return fmt.Errorf("model switch to %q failed: %w", spec, err)
+	}
+	showModelSelectionStatus(sc, spec)
+	return nil
+}
+
+func showModelSelectionStatus(sc *SlashContext, spec string) {
+	if sc.ShowStatus == nil {
+		return
+	}
+	if sc.modelSelectionPersist {
+		sc.ShowStatus("Default model: " + spec)
+		return
+	}
+	_, bareID, found := strings.Cut(spec, "/")
+	if !found {
+		bareID = spec
+	}
+	sc.ShowStatus("Model: " + bareID)
+}
+
+// scopedModelsHandler implements /scoped-models: enable/disable models
+// for Ctrl+P cycling. Mirrors upstream interactive-mode.ts:3925
+// (showModelsSelector). Opens a multi-select toggle list via the
+// editor-slot pattern.
+func scopedModelsHandler(sc *SlashContext) error {
+	if sc.ShowScopedModels == nil {
+		sc.Append("Scoped models selector not available in this context.")
+		return nil
+	}
+	sc.ShowScopedModels()
+	return nil
+}
+
+// loginHandler configures provider authentication, using an optional provider ID or display name.
+func loginHandler(sc *SlashContext) error {
+	if sc.LoginProviders == nil || sc.StartProviderLogin == nil {
+		sc.Append("Provider login is not available in this context.")
+		return nil
+	}
+	return handleLoginCommand(sc)
+}
+
+// logoutHandler removes a stored credential without changing environment or models.json configuration.
+func logoutHandler(sc *SlashContext) error {
+	if sc.LogoutProviders == nil || sc.Logout == nil {
+		sc.Append("Provider logout is not available in this context.")
+		return nil
+	}
+	return handleLogoutCommand(sc)
+}
+
+func copyHandler(sc *SlashContext) error {
+	if sc.LastAssistant == nil || sc.CopyClipboard == nil {
+		sc.Append("Clipboard unavailable in this build.")
+		return nil
+	}
+	// Mirrors upstream handleCopyCommand(): failures surface through
+	// showError, which the dispatcher renders for a returned error.
+	text := sc.LastAssistant()
+	if text == "" {
+		return errors.New("No agent messages to copy yet.")
+	}
+	if err := sc.CopyClipboard(text); err != nil {
+		return err
+	}
+	showStatusOrAppend(sc, "Copied last agent message to clipboard")
+	return nil
+}
+
+func sessionHandler(sc *SlashContext) error {
+	// Mirrors upstream handleSessionCommand (interactive-mode.ts:5169-5207).
+	// Uses ANSI styling (bold + dim) via Text component, not Markdown.
+	bold := func(s string) string { return "\033[1m" + s + "\033[22m" }
+	dim := func(s string) string { return "\033[2m" + s + "\033[22m" }
+
+	var b strings.Builder
+	b.WriteString(bold("Session Info") + "\n\n")
+
+	var sessionName string
+	if sc.GetSessionName != nil {
+		sessionName = sc.GetSessionName()
+	}
+	if sessionName != "" {
+		fmt.Fprintf(&b, "%s %s\n", dim("Name:"), sessionName)
+	}
+
+	// File + ID from session.
+	if sc.CurrentSession != nil {
+		if s := sc.CurrentSession(); s != nil {
+			path := s.Path()
+			if path == "" {
+				path = "In-memory"
+			}
+			fmt.Fprintf(&b, "%s %s\n", dim("File:"), path)
+			fmt.Fprintf(&b, "%s %s\n", dim("ID:"), s.ID())
+		}
+	} else if sc.SessionInfo != nil {
+		id, _, _ := sc.SessionInfo()
+		if id != "" {
+			fmt.Fprintf(&b, "%s %s\n", dim("ID:"), id)
+		}
+	}
+
+	var stats SessionAccounting
+	if sc.CurrentSession != nil {
+		if s := sc.CurrentSession(); s != nil {
+			stats = s.Accounting()
+		}
+	}
+	b.WriteString("\n" + bold("Messages") + "\n")
+	fmt.Fprintf(&b, "%s %d\n", dim("Total:"), stats.TotalMessages)
+	fmt.Fprintf(&b, "%s %d\n", dim("User:"), stats.UserMessages)
+	fmt.Fprintf(&b, "%s %d\n", dim("Assistant:"), stats.AssistantMessages)
+	fmt.Fprintf(&b, "%s %d calls, %d results\n", dim("Tools:"), stats.ToolCalls, stats.ToolResults)
+
+	ts := stats.Tokens
+	promptTokens := ts.Input + ts.CacheRead + ts.CacheWrite
+	b.WriteString("\n" + bold("Tokens") + "\n")
+	fmt.Fprintf(&b, "%s %s\n", dim("Input:"), formatNumber(promptTokens))
+	if promptTokens > 0 && (ts.CacheRead > 0 || ts.CacheWrite > 0) {
+		fmt.Fprintf(&b, "  %s %s %s\n", dim("Cached:"), formatNumber(ts.CacheRead), dim("("+tui.JSToFixed((float64(ts.CacheRead)/float64(promptTokens))*100, 1)+"%)"))
+		written := ""
+		if ts.CacheWrite > 0 {
+			written = " " + dim(fmt.Sprintf("(%s written to cache)", formatNumber(ts.CacheWrite)))
+		}
+		fmt.Fprintf(&b, "  %s %s%s\n", dim("Uncached:"), formatNumber(ts.Input+ts.CacheWrite), written)
+	}
+	fmt.Fprintf(&b, "%s %s\n", dim("Output:"), formatNumber(ts.Output))
+	fmt.Fprintf(&b, "%s %s\n", dim("Total:"), formatNumber(ts.Total))
+	writeCacheWarmingSection(&b, sc, bold, dim)
+
+	if ts.Cost > 0 || stats.CacheWaste.MissedTokens > 0 {
+		b.WriteString("\n" + bold("Cost") + "\n")
+		fmt.Fprintf(&b, "%s $%s", dim("Total:"), tui.JSToFixed(ts.Cost, 3))
+		// A single entry repeats the total, unless it names a model other than the selected one.
+		// upstream: packages/coding-agent/src/modes/interactive/interactive-mode.ts handleSessionCommand renderInfo
+		selectedModelKey := "undefined/undefined"
+		if sc.SelectedModelKey != nil {
+			selectedModelKey = sc.SelectedModelKey()
+		}
+		if len(stats.UsageBreakdown) > 1 || (len(stats.UsageBreakdown) == 1 && stats.UsageBreakdown[0].Key != selectedModelKey) {
+			for _, entry := range stats.UsageBreakdown {
+				fmt.Fprintf(&b, "\n  %s $%s %s", dim(entry.Key+":"), tui.JSToFixed(entry.Cost, 3), dim(fmt.Sprintf("(%s tokens)", formatTokens(entry.Tokens))))
+			}
+		}
+		if stats.CacheWaste.MissedTokens > 0 {
+			missLabel := fmt.Sprintf("%d misses", stats.CacheWaste.MissCount)
+			if stats.CacheWaste.MissCount == 1 {
+				missLabel = "1 miss"
+			}
+			detail := fmt.Sprintf("%s tokens, %s", formatNumber(stats.CacheWaste.MissedTokens), missLabel)
+			if stats.CacheWaste.MissedCost >= 0.0001 {
+				fmt.Fprintf(&b, "\n%s $%s %s", dim("Cache Re-billed:"), tui.JSToFixed(stats.CacheWaste.MissedCost, 3), dim("("+detail+")"))
+			} else {
+				fmt.Fprintf(&b, "\n%s %s", dim("Cache Re-billed:"), detail)
+			}
+		}
+	}
+
+	// Use AppendText (not Append/Markdown): upstream uses new Text(info, 1, 0)
+	// for /session output (plain ANSI text with 1px left padding).
+	if sc.AppendText != nil {
+		sc.AppendText(b.String())
+	} else {
+		sc.Append(b.String())
+	}
+	return nil
+}
+
+// writeCacheWarmingSection renders the /session "Cache Warming" block.
+// Mirrors upstream handleSessionCommand (interactive-mode.ts:6472-6480).
+func writeCacheWarmingSection(b *strings.Builder, sc *SlashContext, bold, dim func(string) string) {
+	mode := defaultCacheWarmingMode
+	if sc.SettingsManager != nil {
+		mode = sc.SettingsManager.GetCacheWarmingMode()
+	}
+	var status *CacheWarmingStatus
+	if sc.CacheWarmingStatus != nil {
+		status = sc.CacheWarmingStatus()
+	}
+	statusText := "Inactive (cache warming unavailable)"
+	if status != nil {
+		statusText = FormatCacheWarmingStatus(*status, time.Now().UnixMilli())
+	}
+	b.WriteString("\n" + bold("Cache Warming") + "\n")
+	fmt.Fprintf(b, "%s %s\n", dim("Mode:"), mode)
+	fmt.Fprintf(b, "%s %s\n", dim("Status:"), statusText)
+	if status != nil && status.Decision != nil && status.Decision.EconomicsAvailable {
+		fmt.Fprintf(b, "%s $%s\n", dim("Cache miss penalty:"), jsToFixed(status.Decision.MissCost, 3))
+		fmt.Fprintf(b, "%s $%s\n", dim("Refresh cost:"), jsToFixed(status.Decision.WarmCost, 3))
+	}
+}
+
+// formatNumber adds comma separators to an integer, matching
+// upstream's toLocaleString() for readability.
+func formatNumber(n int) string {
+	if n < 0 {
+		return "-" + formatNumber(-n)
+	}
+	s := fmt.Sprintf("%d", n)
+	if len(s) <= 3 {
+		return s
+	}
+	var buf strings.Builder
+	leader := len(s) % 3
+	if leader > 0 {
+		buf.WriteString(s[:leader])
+	}
+	for i := leader; i < len(s); i += 3 {
+		if buf.Len() > 0 {
+			buf.WriteByte(',')
+		}
+		buf.WriteString(s[i : i+3])
+	}
+	return buf.String()
+}
+
+func hotkeysHandler(sc *SlashContext) error {
+	if sc.ShowHotkeys != nil {
+		sc.ShowHotkeys()
+	} else {
+		sc.Append(hotkeysMarkdown())
+	}
+	return nil
+}
+
+func newHandler(sc *SlashContext) error {
+	// Upstream: /new calls runtimeHost.newSession() which creates a fresh
+	// JSONL file + resets agent messages + emits session lifecycle events.
+	// NewSession also shows "✓ New session started" in the cleared
+	// transcript, as upstream handleClearCommand does.
+	if sc.NewSession != nil {
+		if err := sc.NewSession(); err != nil {
+			if sc.FatalRuntimeError != nil {
+				return sc.FatalRuntimeError("Failed to create session", err)
+			}
+			return fmt.Errorf("/new: %w", err)
+		}
+		return nil
+	}
+	// Fallback for test contexts where NewSession is not wired.
+	if sc.Reset != nil {
+		sc.Reset()
+	}
+	if sc.Clear != nil {
+		sc.Clear()
+	}
+	sc.Append("Started a fresh conversation. Message history cleared.")
+	return nil
+}
+
+// thinkingHandler mirrors upstream handleThinkingCommand: without an argument
+// it opens the thinking selector; with one it selects the matching available
+// level, ignoring case.
+func thinkingHandler(sc *SlashContext) error {
+	if sc.AvailableThinkingLevels == nil || sc.SelectThinkingLevel == nil {
+		sc.Append("Thinking level selection is not available in this context.")
+		return nil
+	}
+	levels := sc.AvailableThinkingLevels()
+	if search := strings.TrimSpace(sc.Args); search != "" {
+		for _, level := range levels {
+			if strings.EqualFold(level, search) {
+				sc.SelectThinkingLevel(level)
+				return nil
+			}
+		}
+		return fmt.Errorf("Unknown thinking level %q. Available levels: %s.", search, strings.Join(levels, ", "))
+	}
+	if sc.ShowThinkingSelector != nil {
+		sc.ShowThinkingSelector()
+		return nil
+	}
+	if sc.ShowSelectList == nil {
+		sc.Append("Available thinking levels: " + strings.Join(levels, ", "))
+		return nil
+	}
+	options := make([]tui.SelectItem, len(levels))
+	for i, level := range levels {
+		options[i] = tui.SelectItem{Value: level, Label: level, Description: thinkingDescriptions[level]}
+	}
+	current := ""
+	if sc.CurrentThinkingLevel != nil {
+		current = sc.CurrentThinkingLevel()
+	}
+	if chosen, ok := sc.ShowSelectList("Thinking Level", "Select reasoning depth for thinking-capable models", options, current); ok && chosen != "" {
+		sc.SelectThinkingLevel(chosen)
+	}
+	return nil
+}

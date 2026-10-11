@@ -1,0 +1,19 @@
+package main
+
+import (
+	"os"
+
+	"pi/internal/coding/identity"
+)
+
+// setupCli mirrors upstream packages/coding-agent/src/cli/setup.ts, which the
+// CLI and RPC entry points run before main. It sets the process markers child
+// processes inherit. The rest of upstream setupCli has no Go counterpart:
+// process.title is the executable name, Node warnings do not exist, and the
+// HTTP transport is configured from settings in main.
+func setupCli() {
+	_ = os.Setenv("PI_CODING_AGENT", "true") // Setenv fails only for invalid names.
+	// pi divergence (D26): upstream exports AI_AGENT=pi so tools can name the
+	// agent that launched them. Tools that report it must hear pi's name.
+	_ = os.Setenv("AI_AGENT", identity.AgentMarker)
+}

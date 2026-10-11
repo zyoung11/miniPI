@@ -1,0 +1,44 @@
+# Build output
+/pi
+*.test
+*.out
+*.prof
+*.pprof
+
+# Test scratch and logs
+tmp/
+*.log
+*.pid
+
+# Local pi state (running pi inside the repo)
+.pi/
+
+# Credentials and local config
+auth.json
+credentials.json
+secrets.json
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+/.npmrc
+/.netrc
+
+# Python cache (wordsegmenter generator scripts)
+__pycache__/
+*.py[cod]
+
+# node_modules (widthx oracle fixtures)
+node_modules
+
+# Editor and OS state
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
