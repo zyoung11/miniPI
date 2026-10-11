@@ -1,4 +1,5 @@
-<pre align="center">
+<div align="center">
+<pre>
             ╔═╗           ╔═╗ ╔═══════╗ ╔═════╗ 
 ╔═════════╗ ╚═╝ ╔═══════╗ ╚═╝ ║ ╔═══╗ ║ ╚═╗ ╔═╝ 
 ║ ╔═╗ ╔═╗ ║ ╔═╗ ║ ╔═══╗ ║ ╔═╗ ║ ╚═══╝ ║   ║ ║   
@@ -6,6 +7,7 @@
 ║ ║ ║ ║ ║ ║ ║ ║ ║ ║   ║ ║ ║ ║ ║ ║       ╔═╝ ╚═╗ 
 ╚═╝ ╚═╝ ╚═╝ ╚═╝ ╚═╝   ╚═╝ ╚═╝ ╚═╝       ╚═════╝ 
 </pre>
+</div>
 miniPI is a minimal coding agent for the terminal, built as a single native Go binary. It reads your `~/.pi` configuration directly, starts instantly, and needs no Node.js.
 
 It keeps what matters in a coding agent: the agent loop, tools, skills, JSONL sessions. Everything else — extensions, MCP, RPC mode, package management, self-update — is gone.
@@ -31,9 +33,20 @@ pi  →  PiG  →  miniPI
 - **llama.cpp support** with chat-template thinking detection and per-level probing
 - **Full `~/.pi` compatibility** — settings, auth, models, themes and keybindings files are shared with pi as-is
 
+## Download
+
+Prebuilt binaries for Linux and Windows are attached to each [release](https://github.com/zyoung11/miniPI/releases). Pick the one for your platform, make it executable, and put it on your PATH:
+
+```bash
+chmod +x miniPI-linux-amd64
+mv miniPI-linux-amd64 ~/.local/bin/pi
+```
+
+On Windows, rename `miniPI-windows-amd64.exe` to `pi.exe` and place it on your PATH.
+
 ## Getting started
 
-Build it:
+Or build it yourself:
 
 ```bash
 ./build.sh
