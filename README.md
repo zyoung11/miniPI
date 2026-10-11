@@ -6,12 +6,9 @@
 ║ ║ ║ ║ ║ ║ ║ ║ ║ ║   ║ ║ ║ ║ ║ ║       ╔═╝ ╚═╗ 
 ╚═╝ ╚═╝ ╚═╝ ╚═╝ ╚═╝   ╚═╝ ╚═╝ ╚═╝       ╚═════╝ 
 </pre>
-
-# miniPI
-
 miniPI is a minimal coding agent for the terminal, built as a single native Go binary. It reads your `~/.pi` configuration directly, starts instantly, and needs no Node.js.
 
-It keeps what matters in a coding agent: the agent loop, tools, skills, JSONL sessions, and a fast full-screen TUI. Everything else — extensions, MCP, RPC mode, package management, self-update — is gone.
+It keeps what matters in a coding agent: the agent loop, tools, skills, JSONL sessions. Everything else — extensions, MCP, RPC mode, package management, self-update — is gone.
 
 ## Lineage
 
@@ -39,8 +36,7 @@ pi  →  PiG  →  miniPI
 Build it:
 
 ```bash
-./build.sh          # → ./pi
-install -m755 pi ~/.local/bin/pi
+./build.sh
 ```
 
 Then run it in any project:
